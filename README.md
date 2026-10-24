@@ -41,6 +41,10 @@ User (ASI:One) ⇄ Orchestrator ──PlanRequest──▶ Planner
                      │        ◀─SettleResponse─
 ```
 
+**Monetisation (Agent Payment Protocol):** planning is free; settling the bill is the paid step. With `PAYMENT_MODE=settle_fee`, the orchestrator acts as a payment *seller*: after you say who paid what, it sends a `RequestPayment` for a small convenience fee (default 0.1 FET on the Dorado **testnet**, so no real money). ASI:One shows a payment card; when you approve, the orchestrator verifies the `CommitPayment` transaction on-chain, replies `CompletePayment`, and only then settles. A failed check sends `CancelPayment`; a declined card (`RejectPayment`) leaves the bill unsettled. `PAYMENT_MODE=off` (the default) makes settlement free.
+
+Status: the Payment Protocol is published on the orchestrator's Agentverse manifest, and a live test confirmed ASI:One receives the `RequestPayment`. ASI:One only shows the pay card to a user with a linked ASI wallet holding testnet FET, so an end-to-end on-chain payment has not been demonstrated yet; the commit/verify/complete path is covered by tests with the chain lookup mocked.
+
 **Error recovery:** if a worker agent doesn't answer within 30 seconds, the orchestrator computes the result itself with the same code and tells the user. If ASI1 is unavailable, rule-based parsers take over.
 
 ## Run it

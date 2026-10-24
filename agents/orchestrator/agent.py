@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -33,7 +34,10 @@ from agents.config import (
     SETTLEMENT_ADDRESS,
     WORKER_TIMEOUT_SECONDS,
 )
+from uagents_core.contrib.protocols.payment import CancelPayment, CommitPayment, CompletePayment, RejectPayment
+
 from agents.models import PlanRequest, PlanResponse, SettleRequest, SettleResponse
+from agents.orchestrator import payments as pay
 from agents.orchestrator import replies
 from agents.parsing import merge_trip, missing_fields, parse_card_selection, parse_payments, parse_trip
 from agents.planner.service import make_plan_response
@@ -114,6 +118,11 @@ async def _start_settling(ctx: Context, user: str, s: dict, members: list[str], 
     await ctx.send(SETTLEMENT_ADDRESS, req)
 
 
+async def _request_fee(ctx: Context, user: str, s: dict) -> None:
+    ctx.logger.info(f"Requesting {pay.SETTLE_FEE_FET} testnet FET from {user[:16]}…")
+    await ctx.send(user, pay.build_request(str(orchestrator.wallet.address()), reference=user))
+
+
 async def _handle_text(ctx: Context, user: str, text: str) -> None:
     s = _session(user)
     selection = parse_card_selection(text)
@@ -125,6 +134,17 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
 
     if s["stage"] in ("planning", "settling"):
         await _reply(ctx, user, "Still working on your last request. Give me a few seconds.")
+        return
+
+    if s["stage"] == "awaiting_payment":
+        if "pay" in text.lower():
+            await _request_fee(ctx, user, s)
+        else:
+            await _reply(
+                ctx, user,
+                f"To settle, approve the {pay.SETTLE_FEE_FET} testnet FET fee on the payment card. "
+                "Reply *pay* to get the card again, or *new trip* to start over.",
+            )
         return
 
     if s["stage"] == "choose_plan":
@@ -170,6 +190,17 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
             if filler not in members:
                 members.append(filler)
             i += 1
+        if pay.fee_enabled():
+            s["stage"] = "awaiting_payment"
+            s["settle_args"] = {"members": members, "payments": payments}
+            await _reply(
+                ctx, user,
+                f"Got it: {len(members)} people, {replies.rupees(sum(payments.values()))} paid in total. "
+                f"Planning is free; settling costs a {pay.SETTLE_FEE_FET} testnet FET convenience fee. "
+                "Approve the payment card and I'll split the bill.",
+            )
+            await _request_fee(ctx, user, s)
+            return
         await _start_settling(ctx, user, s, members, payments)
         return
 
@@ -191,6 +222,8 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
 async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(sender, ChatAcknowledgement(timestamp=datetime.now(timezone.utc), acknowledged_msg_id=msg.msg_id))
     text = " ".join(c.text for c in msg.content if isinstance(c, TextContent) and c.text).strip()
+    # ASI:One prefixes direct messages with the agent mention ("@agent1q… A"); drop it.
+    text = re.sub(r"@agent1[a-z0-9]+\s*", "", text).strip()
     if not text:
         if any(isinstance(c, StartSessionContent) for c in msg.content):
             await _reply(ctx, sender, replies.GREETING)
@@ -210,6 +243,45 @@ async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 
 
 orchestrator.include(chat_proto, publish_manifest=True)
+
+
+# ---------- payment protocol (seller) ----------
+
+@pay.payment_proto.on_message(CommitPayment)
+async def on_commit_payment(ctx: Context, sender: str, msg: CommitPayment):
+    s = _session(sender)
+    if s["stage"] != "awaiting_payment" or not s.get("settle_args"):
+        await ctx.send(sender, CancelPayment(transaction_id=msg.transaction_id, reason="No settlement is waiting for payment."))
+        return
+    buyer = ""
+    if isinstance(msg.metadata, dict):
+        buyer = str(msg.metadata.get("buyer_fet_wallet") or msg.metadata.get("buyer_fet_address") or "")
+    ok, reason = False, "unsupported payment method"
+    if msg.funds.currency == "FET" and msg.funds.payment_method == "fet_direct":
+        ok, reason = await pay.verify_payment(
+            msg.transaction_id, pay.SETTLE_FEE_FET, buyer, str(orchestrator.wallet.address())
+        )
+    ctx.logger.info(f"Payment {msg.transaction_id}: {reason}")
+    if not ok:
+        await ctx.send(sender, CancelPayment(transaction_id=msg.transaction_id, reason=reason))
+        await _reply(ctx, sender, f"I couldn't verify that payment: {reason}. Reply *pay* to try again.")
+        return
+    await ctx.send(sender, CompletePayment(transaction_id=msg.transaction_id))
+    s["payment_note"] = f"Settlement fee of {pay.SETTLE_FEE_FET} testnet FET verified on the Dorado testnet (tx {msg.transaction_id[:12]}…)."
+    args = s.pop("settle_args")
+    await _start_settling(ctx, sender, s, args["members"], args["payments"])
+
+
+@pay.payment_proto.on_message(RejectPayment)
+async def on_reject_payment(ctx: Context, sender: str, msg: RejectPayment):
+    ctx.logger.info(f"Payment rejected by {sender[:16]}…: {msg.reason}")
+    await _reply(
+        ctx, sender,
+        "No problem, the payment was declined, so I haven't settled the bill. Reply *pay* if you change your mind, or *new trip* to start over.",
+    )
+
+
+orchestrator.include(pay.payment_proto, publish_manifest=True)
 
 
 # ---------- worker results ----------
@@ -243,6 +315,7 @@ async def _deliver_settlement(ctx: Context, resp: SettleResponse, note: str = ""
         return
     result = json.loads(resp.result_json)
     s["stage"] = "done"
+    note = " ".join(n for n in (s.pop("payment_note", ""), note) if n)
     await _reply(
         ctx, user, replies.settlement_text(result, s.get("chosen"), note),
         card=replies.settlement_card(result), end=True,
@@ -285,6 +358,10 @@ async def startup(ctx: Context):
     ctx.logger.info(f"Planner: {PLANNER_ADDRESS}")
     ctx.logger.info(f"Settlement: {SETTLEMENT_ADDRESS}")
     ctx.logger.info("ASI1: " + ("enabled" if asi1.enabled() else "DISABLED (no ASI_ONE_API_KEY, using rule-based parsing)"))
+    ctx.logger.info(
+        f"Payments: settle fee {pay.SETTLE_FEE_FET} testnet FET to {orchestrator.wallet.address()}"
+        if pay.fee_enabled() else "Payments: off (PAYMENT_MODE=off)"
+    )
 
 
 if __name__ == "__main__":
