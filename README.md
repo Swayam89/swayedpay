@@ -29,7 +29,10 @@ The whole workflow runs inside an ASI:One conversation. There is no custom front
 | SwayedPay Planner | Budget-checked plans + ASI1 itinerary | `agent1qgfzn38keun49x07dupxwjav4mwv2ql70lrk4rw34tf6tctm282yg95yz28` |
 | SwayedPay Settlement | Equal split + minimum transfers | `agent1qw8gejcq8qce9h0qmvdlt423tu6es94utz8wxyuw7dzezmzheku0yzee3r7` |
 
-Agentverse profiles: [add links after registration]
+Agentverse profiles (all three registered and Active; the orchestrator is ASI Available):
+- [SwayedPay (orchestrator)](https://agentverse.ai/agents/details/agent1q2s8r5839dwshsem7sttwpkxmy59xvde0hjpms75fnc49hdwlwm0vw43ann/profile): chat with it in ASI:One at https://asi1.ai/ai/agent1q2s8r5839dwshsem7sttwpkxmy59xvde0hjpms75fnc49hdwlwm0vw43ann
+- [SwayedPay Planner](https://agentverse.ai/agents/details/agent1qgfzn38keun49x07dupxwjav4mwv2ql70lrk4rw34tf6tctm282yg95yz28/profile)
+- [SwayedPay Settlement](https://agentverse.ai/agents/details/agent1qw8gejcq8qce9h0qmvdlt423tu6es94utz8wxyuw7dzezmzheku0yzee3r7/profile)
 
 ```
 User (ASI:One) ⇄ Orchestrator ──PlanRequest──▶ Planner
