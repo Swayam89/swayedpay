@@ -4,6 +4,7 @@ import pytest
 
 from agents.orchestrator import replies
 from agents.parsing import missing_fields, parse_card_selection, parse_payments, parse_trip
+from agents.data.sample_prices import build_route
 from agents.planner.logic import build_plans
 from agents.settlement.logic import settle
 
@@ -39,9 +40,44 @@ def test_nothing_fits_is_labelled():
     assert plans[0]["name"] == "Closest to your budget"
 
 
-def test_unknown_route_uses_labelled_generic_data():
-    result = build_plans("Pune", "Hampi", 3, 6000, 2)
-    assert "generic" in result["data_label"].lower()
+def _modes(result):
+    return {p["transport"] for p in result["plans"]}
+
+
+def test_estimates_are_labelled_and_distance_based():
+    result = build_plans("Surat", "Delhi", 5, 10000)
+    assert "not live" in result["data_label"]
+    assert 1000 < result["distance_km"] < 1400  # Surat-Delhi is roughly 1,150 km by road
+
+
+def test_long_trip_gets_more_nights_and_fits_budget():
+    result = build_plans("Surat", "Delhi", 5, 10000)
+    assert result["nights_assumed"] and result["nights"] >= 2
+    assert result["plans"][0]["within_budget"]
+
+
+def test_no_overlong_journey_on_a_short_trip():
+    result = build_plans("Surat", "Delhi", 5, 10000, nights=1)
+    assert all(p["travel_hours"] <= 12 for p in result["plans"])
+    assert any("too slow" in n for n in result["notes"])
+
+
+def test_short_trip_has_no_flight_and_long_trip_no_cab():
+    assert not any("Flight" in m for m in _modes(build_plans("Delhi", "Jaipur", 5, 20000)))
+    assert not any("cab" in m for m in _modes(build_plans("Surat", "Delhi", 5, 50000)))
+
+
+def test_hill_rules():
+    manali = build_plans("Delhi", "Manali", 6, 50000)
+    assert not any("Train" in m for m in _modes(manali))
+    assert any("Kullu" in m for m in _modes(manali))
+    darjeeling = build_route("Kolkata", "Darjeeling")
+    assert any("New Jalpaiguri" in t["name"] for t in darjeeling["transport"])
+
+
+def test_too_close_is_rejected():
+    with pytest.raises(ValueError):
+        build_plans("Delhi", "Noida", 3, 2000)
 
 
 def test_settle_matches_deck_example():

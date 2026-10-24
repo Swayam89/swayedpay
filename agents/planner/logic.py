@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 
-from agents.data.sample_prices import get_route
+from agents.data.sample_prices import build_route, max_one_way_hours, suggested_nights
 
 
 def _transport_pp(option: dict, people: int) -> float:
@@ -38,6 +38,7 @@ def cost(route: dict, t: int, s: int, people: int, nights: int) -> dict:
     per_person = sum(breakdown.values())
     return {
         "transport": route["transport"][t]["name"],
+        "travel_hours": round(route["transport"][t]["hours"], 1),
         "stay": route["stay"][s]["name"],
         "breakdown": breakdown,
         "per_person": per_person,
@@ -63,11 +64,19 @@ def budget_fit(route: dict, people: int, nights: int, budget: int) -> tuple[int,
     swaps: list[str] = []
     current = cost(route, t, s, people, nights)
     while current["per_person"] > budget:
+        # Step to the next option down that is actually cheaper (a less comfortable
+        # option is not always cheaper, e.g. an overnight bus vs 3AC on long routes).
         moves = []
-        if t + 1 < len(route["transport"]):
-            moves.append(("t", cost(route, t + 1, s, people, nights)))
-        if s + 1 < len(route["stay"]):
-            moves.append(("s", cost(route, t, s + 1, people, nights)))
+        for j in range(t + 1, len(route["transport"])):
+            c = cost(route, j, s, people, nights)
+            if c["per_person"] < current["per_person"]:
+                moves.append((("t", j), c))
+                break
+        for j in range(s + 1, len(route["stay"])):
+            c = cost(route, t, j, people, nights)
+            if c["per_person"] < current["per_person"]:
+                moves.append((("s", j), c))
+                break
         if not moves:
             break
         fitting = [m for m in moves if m[1]["per_person"] <= budget]
@@ -80,23 +89,45 @@ def budget_fit(route: dict, people: int, nights: int, budget: int) -> tuple[int,
         if best["per_person"] >= current["per_person"]:
             break
         saved = current["per_person"] - best["per_person"]
-        if kind == "t":
-            swaps.append(f"Swapped {current['transport']} → {best['transport']} (saves ₹{saved:,} per person)")
-            t += 1
+        (which, j) = kind
+        if which == "t":
+            swaps.append(f"Swapped {current['transport']} → {best['transport']} (saves ₹{saved:,.0f} per person)")
+            t = j
         else:
-            swaps.append(f"Swapped {current['stay']} → {best['stay']} (saves ₹{saved:,} per person)")
-            s += 1
+            swaps.append(f"Swapped {current['stay']} → {best['stay']} (saves ₹{saved:,.0f} per person)")
+            s = j
         current = best
     return t, s, swaps
 
 
-def build_plans(origin: str, destination: str, people: int, budget_per_person: int, nights: int = 1) -> dict:
+def build_plans(origin: str, destination: str, people: int, budget_per_person: int, nights: int | None = None) -> dict:
+    """nights=None/0 means the user didn't say; pick a length that suits the distance."""
     if people < 1:
         raise ValueError("people must be at least 1")
     if budget_per_person < 1:
         raise ValueError("budget must be positive")
-    nights = max(1, nights or 1)
-    route, label = get_route(origin, destination)
+    route = build_route(origin, destination)
+    label = route["data_label"]
+    notes = list(route.get("notes") or [])
+    nights_assumed = not nights
+    nights = max(1, nights or suggested_nights(route))
+
+    # Drop journeys too long for the trip (no 17-hour train on a 1-night trip).
+    limit = max_one_way_hours(nights)
+    usable = [t for t in route["transport"] if t["hours"] <= limit]
+    dropped = [t for t in route["transport"] if t["hours"] > limit]
+    if not usable:
+        fastest = min(route["transport"], key=lambda t: t["hours"])
+        usable = [fastest]
+        dropped = [t for t in dropped if t is not fastest]
+        notes.append(
+            f"Even the fastest option takes about {round(fastest['hours'])}h each way, "
+            f"which is a lot for {nights} night{'s' if nights != 1 else ''}. Consider a longer trip."
+        )
+    if dropped:
+        names = ", ".join(f"{t['name']} (~{round(t['hours'])}h)" for t in dropped)
+        notes.append(f"Left out options too slow for {nights} night{'s' if nights != 1 else ''}: {names}.")
+    route = {**route, "transport": usable}
 
     t, s, swaps = budget_fit(route, people, nights, budget_per_person)
     fitted = cost(route, t, s, people, nights)
@@ -118,4 +149,11 @@ def build_plans(origin: str, destination: str, people: int, budget_per_person: i
             seen.add(key)
             plans.append(_plan(chr(ord("A") + len(plans)), name, candidate, budget_per_person))
 
-    return {"plans": plans, "data_label": label, "nights": nights}
+    return {
+        "plans": plans,
+        "data_label": label,
+        "nights": nights,
+        "nights_assumed": nights_assumed,
+        "distance_km": route["distance_km"],
+        "notes": notes,
+    }

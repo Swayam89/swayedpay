@@ -53,7 +53,7 @@ def test_full_flow_with_card_selection():
         await orch._handle_text(ctx, USER, "5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max")
         assert "Plan A" in ctx.last_text()
         assert any(isinstance(c, MetadataContent) for c in ctx.to_user[-1].content)
-        assert "Sample estimates" in ctx.last_text()
+        assert "not live fares" in ctx.last_text()
 
         await orch._handle_text(ctx, USER, '{"action": "choose_plan", "plan_id": "A"}')
         assert "who paid what" in ctx.last_text()

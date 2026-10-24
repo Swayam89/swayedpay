@@ -12,7 +12,7 @@ class PlanRequest(Model):
     destination: str
     people: int
     budget_per_person: int
-    nights: int = 1
+    nights: int = 0  # 0 = not given; the planner picks a length that suits the distance
     date: str = ""
 
 
@@ -21,6 +21,10 @@ class PlanResponse(Model):
     plans_json: str = "[]"
     itinerary_json: str = "[]"
     data_label: str = ""
+    nights: int = 1
+    nights_assumed: bool = False
+    distance_km: int = 0
+    notes_json: str = "[]"
     error: str = ""
 
 

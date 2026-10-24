@@ -101,7 +101,7 @@ async def _start_planning(ctx: Context, user: str, s: dict) -> None:
         destination=trip["destination"],
         people=int(trip["people"]),
         budget_per_person=int(trip["budget_per_person"]),
-        nights=int(trip.get("nights") or 1),
+        nights=int(trip.get("nights") or 0),
         date=str(trip.get("date") or ""),
     )
     s["stage"] = "planning"
@@ -299,6 +299,12 @@ async def _deliver_plans(ctx: Context, resp: PlanResponse, note: str = "") -> No
     plans = json.loads(resp.plans_json)
     s["plans"] = plans
     s["stage"] = "choose_plan"
+    s["trip"]["nights"] = resp.nights
+    s["trip"]["distance_km"] = resp.distance_km
+    extra = json.loads(resp.notes_json or "[]")
+    if resp.nights_assumed:
+        extra.insert(0, f"You didn't say how long, so I planned {resp.nights} night{'s' if resp.nights != 1 else ''} to suit the ~{resp.distance_km:,} km journey.")
+    note = " ".join(extra + ([note] if note else []))
     text = replies.plans_text(s["trip"], plans, json.loads(resp.itinerary_json or "[]"), resp.data_label, note)
     await _reply(ctx, user, text, card=replies.plans_card(s["trip"], plans))
 

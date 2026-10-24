@@ -24,7 +24,30 @@ CARD_PROTOCOL_VERSION = "1"
 
 
 def rupees(amount: float) -> str:
-    return f"₹{int(round(amount)):,}"
+    """Indian digit grouping: ₹1,12,840."""
+    n = int(round(amount))
+    sign, digits = ("-" if n < 0 else ""), str(abs(n))
+    if len(digits) > 3:
+        head, tail = digits[:-3], digits[-3:]
+        groups = []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            groups.insert(0, head)
+        digits = ",".join(groups) + "," + tail
+    return f"{sign}₹{digits}"
+
+
+def hours(h: float | None) -> str:
+    if not h:
+        return ""
+    return "under 1h" if h < 1 else f"~{round(h)}h"
+
+
+def transport_label(p: dict) -> str:
+    t = hours(p.get("travel_hours"))
+    return f"{p['transport']} ({t} each way)" if t else p["transport"]
 
 
 def message(text: str, card: dict[str, Any] | None = None, end_session: bool = False) -> ChatMessage:
@@ -64,8 +87,9 @@ def ask_missing(missing: list[str]) -> str:
 def trip_summary(trip: dict) -> str:
     nights = trip.get("nights") or 1
     when = f", {str(trip['date']).title()}" if trip.get("date") else ""
+    km = f" (~{trip['distance_km']:,} km)" if trip.get("distance_km") else ""
     return (
-        f"{trip['origin']} → {trip['destination']}{when} · {trip['people']} people · "
+        f"{trip['origin']} → {trip['destination']}{km}{when} · {trip['people']} people · "
         f"{rupees(trip['budget_per_person'])} each · {nights} night{'s' if nights != 1 else ''}"
     )
 
@@ -82,7 +106,7 @@ def plans_text(trip: dict, plans: list[dict], itinerary: list[str], data_label: 
     for p in plans:
         status = "fits your budget" if p["within_budget"] else f"{rupees(p['over_by'])} over budget"
         lines.append(
-            f"**Plan {p['id']} · {p['name']}**: {p['transport']} + {p['stay']}, "
+            f"**Plan {p['id']} · {p['name']}**: {transport_label(p)} + {p['stay']}, "
             f"{rupees(p['per_person'])} per person ({rupees(p['total'])} total), {status}."
         )
         b = p["breakdown"]
@@ -99,7 +123,9 @@ def plans_text(trip: dict, plans: list[dict], itinerary: list[str], data_label: 
     lines += ["", f"_{data_label}._"]
     if note:
         lines += ["", f"_{note}_"]
-    lines += ["", "Reply **A**, **B** or **C**, or tap a plan on the card."]
+    ids = [f"**{p['id']}**" for p in plans]
+    choices = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " or " + ids[-1]
+    lines += ["", f"Reply {choices}, or tap a plan on the card."]
     return "\n".join(lines)
 
 
@@ -116,7 +142,7 @@ def plans_card(trip: dict, plans: list[dict]) -> dict[str, Any]:
                         "gap": 8,
                         "children": [
                             {"type": "heading", "value": f"Plan {p['id']} · {p['name']}", "level": 3},
-                            {"type": "text", "value": f"{p['transport']} + {p['stay']}", "style": "body"},
+                            {"type": "text", "value": f"{transport_label(p)} + {p['stay']}", "style": "body"},
                             {
                                 "type": "text",
                                 "value": f"{rupees(p['per_person'])} per person · {rupees(p['total'])} total",
@@ -146,7 +172,7 @@ def plans_card(trip: dict, plans: list[dict]) -> dict[str, Any]:
 
 def ask_payments(plan: dict, people: int) -> str:
     return (
-        f"Plan {plan['id']} it is: {plan['transport']} + {plan['stay']}, "
+        f"Plan {plan['id']} it is: {transport_label(plan)} + {plan['stay']}, "
         f"{rupees(plan['total'])} for the group.\n\n"
         f"Now tell me who's in the group of {people} and who paid what, for example:\n"
         "*Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.*"

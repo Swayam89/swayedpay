@@ -77,7 +77,13 @@ Then connect each one to Agentverse: open the **Agent Inspector** link printed i
 - `Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.`
 - `new trip` to start over
 
-Sample routes: Delhi ↔ Jaipur, Agra, Rishikesh, Manali; Mumbai ↔ Goa, Lonavala; Bangalore ↔ Coorg, Mysore. Gurugram, Noida and New Delhi count as Delhi. Other routes use labelled generic estimates.
+**Works for any two places in India.** Prices are estimated from distance with realistic rules (not live fares):
+
+- About 60 cities are built in (coordinates, airports, railheads, hill roads); any other town is looked up on OpenStreetMap and borrows the facts of the nearest known city (e.g. Kasol → near Manali).
+- Flights only for 400+ km when both ends have an airport within reach (Manali uses Kullu, Darjeeling uses Bagdogra), including the airport transfers.
+- A private cab only up to 700 km; buses up to 1,500 km; trains only where the railway reaches, with railhead transfers for hill towns (Darjeeling via New Jalpaiguri, Nainital via Kathgodam). No trains to Manali, Leh or Srinagar.
+- Every option shows its travel time. If you don't say how long the trip is, SwayedPay picks enough nights for the journey, and it drops options too slow for the trip (no 17-hour train on a 1-night trip).
+- Hotels, food and local travel cost more in metros and tourist hubs, less in small towns.
 
 ## Tests
 
