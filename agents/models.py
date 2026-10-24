@@ -31,7 +31,8 @@ class PlanResponse(Model):
 class SettleRequest(Model):
     user_address: str
     members_json: str
-    payments_json: str
+    payments_json: str = "{}"  # simple equal split: {name: amount}
+    expenses_json: str = "[]"  # preferred: [{payer, amount, label, excluded, only}]
 
 
 class SettleResponse(Model):

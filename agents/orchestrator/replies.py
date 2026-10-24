@@ -121,27 +121,44 @@ def ask_missing_names(members: list[str], people: int) -> str:
     )
 
 
-def confirm_settlement(members: list[str], payments: dict, people: int) -> tuple[str, dict[str, Any]]:
-    total = sum(payments.values())
-    share = total / len(members) if members else 0
-    payers = [f"- {n} paid {rupees(payments[n])}" for n in members if payments.get(n)]
-    non_payers = [n for n in members if not payments.get(n)]
-    lines = ["**Before I settle, please check this is right:**", ""] + payers
+def _who_shares(e: dict) -> str:
+    if e.get("everyone"):
+        return "shared by everyone"
+    sharers = e.get("sharers") or []
+    return f"shared by {', '.join(sharers)}"
+
+
+def confirm_settlement(members: list[str], expenses: list[dict], people: int, preview: dict) -> tuple[str, dict[str, Any]]:
+    total = preview["total"]
+    lines = ["**Before I settle, please check this is right:**", ""]
+    for e in preview["expenses"]:
+        what = f" for {e['label']}" if e["label"] else ""
+        lines.append(f"- {e['payer']} paid {rupees(e['amount'])}{what}, {_who_shares(e)}")
+    non_payers = [n for n in preview["members"] if not preview["paid"].get(n)]
     if non_payers:
         lines.append(f"- {', '.join(non_payers)} paid nothing")
+    lines.append("")
+    if preview["equal"]:
+        lines.append(f"Total {rupees(total)}, split **equally** between {len(preview['members'])} people ({rupees(preview['share'])} each).")
+    else:
+        lines.append(f"Total {rupees(total)}, **not** split equally. Each person's share:")
+        lines += [f"- {n}: {rupees(preview['shares'][n])}" for n in preview["members"]]
+    if people and len(preview["members"]) != people:
+        lines.append(f"Note: you said {people} people earlier, but this list has {len(preview['members'])}.")
     lines += [
         "",
-        f"Total {rupees(total)}, split **equally** between {len(members)} people ({rupees(share)} each).",
+        "Reply **yes** to settle, or correct anything (e.g. *Dev paid 500*, *Kabir skipped dinner*, *remove Kabir*).",
     ]
-    if people and len(members) != people:
-        lines.append(f"Note: you said {people} people earlier, but this list has {len(members)}.")
-    lines += ["", "Reply **yes** to settle, or correct anything (e.g. *Dev paid 500*, *remove Kabir*)."]
-    rows = [{"type": "text", "value": f"{n}: {rupees(payments.get(n, 0))}", "style": "body"} for n in members]
+    rows = [
+        {"type": "text", "value": f"{n}: paid {rupees(preview['paid'].get(n, 0))} · share {rupees(preview['shares'][n])}", "style": "body"}
+        for n in preview["members"]
+    ]
+    split = "split equally" if preview["equal"] else "uneven split"
     card = {
         "root": {
             "type": "section",
             "title": "Check before settling",
-            "subtitle": f"{rupees(total)} total · split equally · {rupees(share)} each",
+            "subtitle": f"{rupees(total)} total · {split}",
             "children": [
                 {"type": "group", "direction": "column", "gap": 6, "children": rows},
                 {"type": "divider"},
@@ -247,17 +264,19 @@ def ask_payments(plan: dict, people: int) -> str:
     return (
         f"Plan {plan['id']} it is: {transport_label(plan)} + {plan['stay']}, "
         f"{rupees(plan['total'])} for the group.\n\n"
-        f"Now tell me the names of all {people} people and who has paid what so far, for example:\n"
-        "*Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.*"
+        f"Once you've spent money on the trip, tell me the names of all {people} people and who paid for what, for example:\n"
+        "*Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000 for the stay, Rahul paid 1500 for dinner. Kabir skipped dinner.*"
     )
 
 
 def settlement_text(result: dict, plan: dict | None, note: str = "") -> str:
-    lines = [
-        f"**Settled.** Total paid {rupees(result['total'])}, split {len(result['members'])} ways "
-        f"({rupees(result['share'])} each).",
-        "",
-    ]
+    if result.get("equal", True):
+        head = (f"**Settled.** Total paid {rupees(result['total'])}, split {len(result['members'])} ways "
+                f"({rupees(result['share'])} each).")
+        lines = [head, ""]
+    else:
+        shares = ", ".join(f"{n} {rupees(result['shares'][n])}" for n in result["members"])
+        lines = [f"**Settled.** Total paid {rupees(result['total'])}, split by who shared what: {shares}.", ""]
     if result["transfers"]:
         lines.append("**Who pays whom:**")
         lines += [f"- {t['from']} pays {t['to']} {rupees(t['amount'])}" for t in result["transfers"]]
@@ -269,29 +288,66 @@ def settlement_text(result: dict, plan: dict | None, note: str = "") -> str:
         lines += ["", f"_Note: the group paid {rupees(abs(diff))} {word} than the plan estimate of {rupees(plan['total'])}._"]
     if note:
         lines += ["", f"_{note}_"]
-    lines += ["", "_No real money was moved. Share this list with your group to settle up._"]
+    lines += [
+        "",
+        "_No real money was moved through SwayedPay._ I'll keep track as people pay each other back: "
+        "tell me *Dev paid Aman* or *Kabir paid Rahul 1000*, tap **Mark paid**, or ask *status*.",
+    ]
     return "\n".join(lines)
 
 
-def settlement_card(result: dict) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = [
-        {"type": "text", "value": f"{t['from']} → {t['to']} · {rupees(t['amount'])}", "style": "body"}
-        for t in result["transfers"]
-    ] or [{"type": "text", "value": "Everyone is already square.", "style": "body"}]
+def _left(t: dict) -> int:
+    return int(t["amount"] - t.get("repaid", 0))
+
+
+def tracker_text(result: dict) -> str:
+    transfers = result["transfers"]
+    if not transfers:
+        return "Everyone is already square. Nothing to track."
+    lines = ["**Payback tracker**", ""]
+    for t in transfers:
+        left = _left(t)
+        if left <= 0:
+            lines.append(f"- Paid: {t['from']} → {t['to']} {rupees(t['amount'])}")
+        elif t.get("repaid"):
+            lines.append(f"- Part paid: {t['from']} → {t['to']} {rupees(t['repaid'])} of {rupees(t['amount'])}, {rupees(left)} left")
+        else:
+            lines.append(f"- Pending: {t['from']} → {t['to']} {rupees(t['amount'])}")
+    outstanding = sum(max(0, _left(t)) for t in transfers)
+    lines.append("")
+    lines.append("**Everyone is settled up.**" if outstanding == 0 else f"Still to be paid back: {rupees(outstanding)}.")
+    return "\n".join(lines)
+
+
+def tracker_card(result: dict) -> dict[str, Any]:
+    items = []
+    for i, t in enumerate(result["transfers"]):
+        left = _left(t)
+        status = "Paid" if left <= 0 else (f"{rupees(left)} left" if t.get("repaid") else "Pending")
+        children: list[dict[str, Any]] = [{
+            "type": "group", "direction": "column", "gap": 4, "children": [
+                {"type": "text", "value": f"{t['from']} → {t['to']} · {rupees(t['amount'])}", "style": "body"},
+                {"type": "badge", "label": status, "variant": "info"},
+            ],
+        }]
+        if left > 0:
+            children.append({
+                "type": "button", "label": "Mark paid", "primary": False,
+                "action": {"selection": {"action": "mark_paid", "index": str(i)}},
+            })
+        items.append({"children": children})
+    outstanding = sum(max(0, _left(t)) for t in result["transfers"])
+    body: list[dict[str, Any]] = [{"type": "list", "items": items}] if items else [
+        {"type": "text", "value": "Everyone is already square.", "style": "body"}]
     return {
         "root": {
             "type": "section",
             "title": "Who pays whom",
-            "subtitle": f"{rupees(result['total'])} total · {rupees(result['share'])} each",
-            "children": [
-                {"type": "group", "direction": "column", "gap": 8, "children": rows},
+            "subtitle": f"{rupees(result['total'])} total · {rupees(outstanding)} still to pay back",
+            "children": body + [
                 {"type": "divider"},
-                {
-                    "type": "button",
-                    "label": "Plan another trip",
-                    "primary": False,
-                    "action": {"selection": {"action": "new_trip"}},
-                },
+                {"type": "button", "label": "Plan another trip", "primary": False,
+                 "action": {"selection": {"action": "new_trip"}}},
             ],
         }
     }

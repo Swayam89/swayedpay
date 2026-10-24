@@ -132,6 +132,37 @@ def parse_payments(text: str) -> dict:
     return {"members": members, "payments": payments}
 
 
+_EXCLUSION = re.compile(
+    r"\b([A-Z][a-zA-Z]+)\s+(?:skipped|missed|didn'?t\s+(?:have|join|eat|take|come for|share)|did not\s+(?:have|join|eat|take|share)|"
+    r"wasn'?t\s+(?:at|there for|part of|in)|was not\s+(?:at|part of|in)|isn'?t\s+(?:in|part of)|"
+    r"(?:is|was)\s+not\s+(?:in|part of)|didn'?t\s+go\s+(?:for|on))\s+(?:the\s+)?([a-z]+(?:\s[a-z]+)?)",
+)
+_EXPENSE = re.compile(
+    r"\b([A-Z][a-zA-Z]+)\s+(?:has\s+|have\s+)?(?:paid|spent|put in|covered|gave)\s*(?:₹|rs\.?|inr)?\s*(\d[\d,]*k?)"
+    r"(?:\s+(?:for|on)\s+(?:the\s+)?([a-z]+(?:\s[a-z]+)?))?",
+)
+_STOP_LABEL = {"everyone", "all", "us", "the", "group", "it"}
+
+
+def parse_expenses(text: str) -> dict:
+    """{"members", "expenses": [{payer, amount, label, excluded, only}], "exclusions": [{name, label}]}."""
+    expenses = []
+    for m in _EXPENSE.finditer(text):
+        amount = to_int(m.group(2))
+        if amount is None:
+            continue
+        label = (m.group(3) or "").strip().lower()
+        label = "" if label in _STOP_LABEL else label.split(" except")[0]
+        expenses.append({"payer": m.group(1), "amount": amount, "label": label, "excluded": [], "only": []})
+    exclusions = [{"name": m.group(1), "label": m.group(2).strip().lower()} for m in _EXCLUSION.finditer(text)]
+    simple = parse_payments(text)
+    members = list(simple["members"])
+    for ex in exclusions:
+        if ex["name"] not in members:
+            members.append(ex["name"])
+    return {"members": members, "expenses": expenses, "exclusions": exclusions}
+
+
 _PLAN_PATTERNS = [
     re.compile(r"plan[_\s-]?id[\s:=\"']*([abc])\b", re.IGNORECASE),
     re.compile(r"\b(?:plan|option)\s*([abc])\b", re.IGNORECASE),
@@ -150,7 +181,7 @@ def parse_card_selection(text: str) -> dict | None:
         try:
             data = json.loads(stripped)
             if isinstance(data, dict):
-                selection = {k: str(v) for k, v in data.items() if k in ("action", "plan_id")}
+                selection = {k: str(v) for k, v in data.items() if k in ("action", "plan_id", "index")}
                 if selection:
                     if "plan_id" in selection:
                         selection["plan_id"] = selection["plan_id"].upper()
@@ -161,6 +192,9 @@ def parse_card_selection(text: str) -> dict | None:
         return {"action": "new_trip"}
     if re.search(r"confirm[_\s-]?settle", stripped, re.IGNORECASE):
         return {"action": "confirm_settle"}
+    m = re.search(r"mark[_\s-]?paid.*?index[\s:=\"']*(\d+)|index[\s:=\"']*(\d+).*?mark[_\s-]?paid", stripped, re.IGNORECASE)
+    if m:
+        return {"action": "mark_paid", "index": m.group(1) or m.group(2)}
     for pattern in _PLAN_PATTERNS:
         m = pattern.search(stripped)
         if m:

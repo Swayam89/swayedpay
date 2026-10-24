@@ -17,6 +17,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
@@ -38,8 +39,10 @@ from agents.config import (
 from uagents_core.contrib.protocols.payment import CancelPayment, CommitPayment, CompletePayment, RejectPayment
 
 from agents.models import PlanRequest, PlanResponse, SettleRequest, SettleResponse
+from agents.orchestrator import booking
 from agents.orchestrator import payments as pay
 from agents.orchestrator import replies
+from agents.settlement.logic import settle_expenses
 from agents.data import geo
 from agents.data.sample_prices import RouteError, build_route, suggested_nights
 from agents.parsing import (
@@ -50,8 +53,9 @@ from agents.parsing import (
     merge_trip,
     missing_questions,
     parse_card_selection,
-    parse_payments,
+    parse_expenses,
     parse_trip,
+    to_int,
 )
 from agents.planner.service import make_plan_response
 from agents.settlement.service import make_settle_response
@@ -69,11 +73,41 @@ chat_proto = Protocol(spec=chat_protocol_spec)
 
 SESSIONS: dict[str, dict] = {}
 
+# Conversations are saved to disk so a restart doesn't lose plans or the payback tracker.
+STATE_FILE = Path(__file__).resolve().parents[2] / "sessions.json"
+PERSIST = True
+
+
+def _save() -> None:
+    if not PERSIST:
+        return
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(SESSIONS))
+        tmp.replace(STATE_FILE)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _load() -> int:
+    if not PERSIST or not STATE_FILE.exists():
+        return 0
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return 0
+    for user, s in data.items():
+        if s.get("stage") in ("planning", "settling"):
+            s["pending"] = s.get("pending")  # the timeout check finishes these
+        SESSIONS[user] = {**_new_session(), **s}
+    return len(data)
+
 
 def _new_session() -> dict:
     return {
         "stage": "idle", "trip": {}, "asked": [], "plans": [], "chosen": None, "pending": None,
-        "members": [], "payments": {}, "awaiting_names": False,
+        "members": [], "expenses": [], "pending_exclusions": [], "awaiting_names": False,
+        "settlement": None,
     }
 
 
@@ -174,8 +208,8 @@ async def _start_planning(ctx: Context, user: str, s: dict) -> None:
     await ctx.send(PLANNER_ADDRESS, req)
 
 
-async def _start_settling(ctx: Context, user: str, s: dict, members: list[str], payments: dict) -> None:
-    req = SettleRequest(user_address=user, members_json=json.dumps(members), payments_json=json.dumps(payments))
+async def _start_settling(ctx: Context, user: str, s: dict, members: list[str], expenses: list[dict]) -> None:
+    req = SettleRequest(user_address=user, members_json=json.dumps(members), expenses_json=json.dumps(expenses))
     s["stage"] = "settling"
     s["pending"] = {"kind": "settle", "since": time.time(), "request": req.dict()}
     ctx.logger.info(f"Asking Settlement for {user[:16]}…")
@@ -218,8 +252,9 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
             s["chosen"] = plan
             s["stage"] = "need_payments"
             s["members"] = [m.title() for m in (s["trip"].get("members") or [])]
-            s["payments"] = {}
-            await _reply(ctx, user, replies.ask_payments(plan, int(s["trip"]["people"])))
+            s["expenses"], s["pending_exclusions"] = [], []
+            text_out = replies.ask_payments(plan, int(s["trip"]["people"])) + "\n\n" + booking.links_markdown(plan, s["trip"])
+            await _reply(ctx, user, text_out)
             return
         guess = parse_trip(text)
         if not (guess.get("destination") or guess.get("people")):
@@ -232,15 +267,31 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
         if (selection or {}).get("action") == "confirm_settle" or is_yes(text):
             await _proceed_to_settle(ctx, user, s)
             return
-        corrections = parse_payments(text)
-        if is_no(text) and not (corrections["payments"] or corrections["members"]):
-            await _reply(ctx, user, "What should I change? For example: *Dev paid 500*, *also add Priya*, or *remove Kabir*.")
+        corrections = parse_expenses(text)
+        if is_no(text) and not (corrections["expenses"] or corrections["members"] or corrections["exclusions"]):
+            await _reply(
+                ctx, user,
+                "What should I change? For example: *Dev paid 500*, *Kabir skipped dinner*, *also add Priya*, or *remove Kabir*.",
+            )
             return
         s["stage"] = "need_payments"  # treat the reply as corrections
 
     if s["stage"] == "need_payments":
         await _collect_payments(ctx, user, s, text)
         return
+
+    if s["stage"] == "settled":
+        if await _track_payback(ctx, user, s, text, selection):
+            return
+        guess = parse_trip(text)
+        if not (guess.get("destination") or guess.get("people")):
+            await _reply(
+                ctx, user,
+                "I'm tracking paybacks for this trip. Tell me when someone pays, e.g. *Dev paid Aman* "
+                "or *Kabir paid Rahul 1000*, ask *status*, or say *new trip*.",
+            )
+            return
+        s.update(_new_session())  # a fresh trip request
 
     # idle, need_info or done: treat as (part of) a trip request
     await _intake(ctx, user, s, text)
@@ -257,6 +308,54 @@ def _names_from_reply(text: str) -> list[str]:
     return names
 
 
+def _title_list(names) -> list[str]:
+    return [str(n).strip().title() for n in (names or []) if str(n).strip()]
+
+
+def _merge_expense(s: dict, e: dict) -> None:
+    """Same payer + same purpose replaces the amount (a correction); otherwise it's a new expense."""
+    try:
+        amount = int(float(str(e.get("amount", "")).replace(",", "")))
+    except ValueError:
+        return
+    payer = str(e.get("payer", "")).strip().title()
+    if not payer or amount < 0:
+        return
+    label = re.sub(r"^the\s+", "", str(e.get("label") or "").strip().lower())
+    excluded, only = _title_list(e.get("excluded")), _title_list(e.get("only"))
+    for existing in s["expenses"]:
+        if existing["payer"] == payer and existing["label"] == label:
+            existing["amount"] = amount
+            existing["excluded"] = sorted(set(existing["excluded"]) | set(excluded))
+            if only:
+                existing["only"] = only
+            return
+    s["expenses"].append({"payer": payer, "amount": amount, "label": label, "excluded": excluded, "only": only})
+
+
+def _label_matches(wanted: str, label: str) -> bool:
+    norm = lambda w: w.lower().rstrip("s")  # noqa: E731  ("drinks" ~ "drink")
+    wanted_words = {norm(w) for w in wanted.split() if w}
+    return bool(label) and bool(wanted_words & {norm(w) for w in label.split()})
+
+
+def _apply_exclusions(s: dict) -> list[dict]:
+    """Apply 'Kabir skipped dinner' to the matching expense. Returns the ones we can't place."""
+    unresolved = []
+    for ex in s["pending_exclusions"]:
+        name, label = ex["name"].title(), ex["label"]
+        matches = [e for e in s["expenses"] if _label_matches(label, e["label"])]
+        if not matches:
+            unresolved.append(ex)
+            continue
+        for e in matches:
+            if name not in e["excluded"]:
+                e["excluded"].append(name)
+            e["only"] = [n for n in e["only"] if n != name]
+    s["pending_exclusions"] = unresolved
+    return unresolved
+
+
 async def _collect_payments(ctx: Context, user: str, s: dict, text: str) -> None:
     if s.get("awaiting_names") and s["members"] and re.search(
         r"that'?s (?:everyone|all|it)|that is (?:everyone|all)|no ?one else|nobody else|only (?:us|them|these)|just (?:us|them|these)",
@@ -264,65 +363,170 @@ async def _collect_payments(ctx: Context, user: str, s: dict, text: str) -> None
     ):
         s["awaiting_names"] = False
         s["trip"]["people"] = len(s["members"])
-        s["stage"] = "confirm_settle"
-        text_out, card = replies.confirm_settlement(s["members"], s["payments"], len(s["members"]))
-        await _reply(ctx, user, text_out, card=card)
+        await _confirm_or_ask(ctx, user, s)
         return
 
-    removed = re.findall(r"remove\s+([A-Za-z]+)", text, re.IGNORECASE)
+    removed = [n.title() for n in re.findall(r"remove\s+([A-Za-z]+)", text, re.IGNORECASE)]
     for name in removed:
-        name = name.title()
         s["members"] = [m for m in s["members"] if m != name]
-        s["payments"].pop(name, None)
+        s["expenses"] = [e for e in s["expenses"] if e["payer"] != name]
+        for e in s["expenses"]:
+            e["excluded"] = [n for n in e["excluded"] if n != name]
+            e["only"] = [n for n in e["only"] if n != name]
 
-    llm = await asi1.extract_payments(text) or {}
-    rule = parse_payments(text)
-    for source in (rule.get("payments") or {}, llm.get("payments") or {}):
-        for name, amount in source.items():
-            try:
-                s["payments"][str(name).strip().title()] = int(float(str(amount).replace(",", "")))
-            except ValueError:
-                continue
-    new_names = list(llm.get("members") or []) + list(rule.get("members") or []) + list(s["payments"])
+    llm = await asi1.extract_expenses(text, s["members"]) or {}
+    rule = parse_expenses(text)
+    # Use ASI1's reading when it found expenses, else the rule-based one (never both: no double counting).
+    expenses = llm.get("expenses") if isinstance(llm.get("expenses"), list) and llm.get("expenses") else rule["expenses"]
+    for e in expenses:
+        if isinstance(e, dict):
+            _merge_expense(s, e)
+    exclusions = [x for x in (llm.get("exclusions") or []) if isinstance(x, dict) and x.get("name") and x.get("label")]
+    for x in exclusions or rule["exclusions"]:
+        s["pending_exclusions"].append({"name": str(x["name"]).title(), "label": str(x["label"]).lower()})
+
+    new_names = list(llm.get("members") or []) + list(rule.get("members") or [])
+    new_names += [e["payer"] for e in s["expenses"]] + [x["name"] for x in s["pending_exclusions"]]
     if s.get("awaiting_names") and not new_names:
         new_names = _names_from_reply(text)
     for name in new_names:
         name = str(name).strip().title()
-        if name and name not in s["members"] and name not in [r.title() for r in removed]:
+        if name and name not in s["members"] and name not in removed:
             s["members"].append(name)
     s["awaiting_names"] = False
+    await _confirm_or_ask(ctx, user, s)
 
+
+async def _confirm_or_ask(ctx: Context, user: str, s: dict) -> None:
+    """Ask for whatever is still missing; otherwise show the summary to confirm."""
     people = int(s["trip"].get("people") or 0)
-    if not s["payments"]:
+    if not s["expenses"]:
         await _reply(
             ctx, user,
-            "Who paid for what so far? For example: *Aman paid 9000, Rahul paid 4250.* "
+            "Who paid for what so far? For example: *Aman paid 9000 for the stay, Rahul paid 1500 for dinner.* "
             "If nobody has paid yet, I can't settle anything.",
+        )
+        return
+    unresolved = _apply_exclusions(s)
+    if unresolved:
+        ex = unresolved[0]
+        await _reply(
+            ctx, user,
+            f"You said {ex['name']} wasn't part of the {ex['label']}, but I don't know which payment was the "
+            f"{ex['label']}. Who paid for it, and how much? For example: *Rahul paid 1500 for {ex['label']}*.",
         )
         return
     if people and len(s["members"]) < people:
         s["awaiting_names"] = True
         await _reply(ctx, user, replies.ask_missing_names(s["members"], people))
         return
+    try:
+        preview = settle_expenses(s["members"], s["expenses"])
+    except ValueError as exc:
+        await _reply(ctx, user, f"That doesn't add up yet: {exc} Could you correct it?")
+        return
     s["stage"] = "confirm_settle"
-    text_out, card = replies.confirm_settlement(s["members"], s["payments"], people)
+    text_out, card = replies.confirm_settlement(s["members"], s["expenses"], people, preview)
     await _reply(ctx, user, text_out, card=card)
 
 
 async def _proceed_to_settle(ctx: Context, user: str, s: dict) -> None:
-    members, payments = list(s["members"]), dict(s["payments"])
+    members, expenses = list(s["members"]), [dict(e) for e in s["expenses"]]
     if pay.fee_enabled():
         s["stage"] = "awaiting_payment"
-        s["settle_args"] = {"members": members, "payments": payments}
+        s["settle_args"] = {"members": members, "expenses": expenses}
         await _reply(
             ctx, user,
-            f"Confirmed: {len(members)} people, {replies.rupees(sum(payments.values()))} paid in total. "
+            f"Confirmed: {len(members)} people, {replies.rupees(sum(e['amount'] for e in expenses))} paid in total. "
             f"Planning is free; settling costs a {pay.SETTLE_FEE_FET} testnet FET convenience fee. "
             "Approve the payment card and I'll split the bill.",
         )
         await _request_fee(ctx, user, s)
         return
-    await _start_settling(ctx, user, s, members, payments)
+    await _start_settling(ctx, user, s, members, expenses)
+
+
+# ---------- payback tracking (after settling) ----------
+
+_PAID_WORDS = re.compile(r"\b(paid|pays|sent|transferred|returned|repaid|settled|cleared|gave|done)\b", re.IGNORECASE)
+
+
+def _mentioned(text: str, names: list[str]) -> list[str]:
+    hits = []
+    for name in names:
+        m = re.search(rf"\b{re.escape(name)}\b", text, re.IGNORECASE)
+        if m:
+            hits.append((m.start(), name))
+    return [n for _, n in sorted(hits)]
+
+
+async def _track_payback(ctx: Context, user: str, s: dict, text: str, selection: dict | None) -> bool:
+    """Handle 'Dev paid Aman', 'Kabir paid Rahul 1000', 'status' or a Mark-paid tap. Returns True if handled."""
+    result = s["settlement"]
+    transfers = result["transfers"]
+
+    if (selection or {}).get("action") == "mark_paid":
+        i = int(selection.get("index", -1))
+        if 0 <= i < len(transfers):
+            transfers[i]["repaid"] = transfers[i]["amount"]
+        await _reply(ctx, user, replies.tracker_text(result), card=replies.tracker_card(result))
+        return True
+
+    if re.search(r"\b(status|who owes|who still owes|pending|tracker|left to pay|balance)\b", text, re.IGNORECASE):
+        await _reply(ctx, user, replies.tracker_text(result), card=replies.tracker_card(result))
+        return True
+
+    if not _PAID_WORDS.search(text):
+        return False
+    names = _mentioned(text, result["members"])
+    if not names:
+        await _reply(ctx, user, "Who paid whom? For example: *Dev paid Aman* or *Kabir paid Rahul 1000*.")
+        return True
+    payer, to = names[0], (names[1] if len(names) > 1 else None)
+    amounts = re.findall(r"(?:₹|rs\.?\s*)?(\d[\d,]*k?)\b", text, re.IGNORECASE)
+    amount = to_int(amounts[-1]) if amounts else None
+    open_ = [t for t in transfers if t["from"] == payer and t["repaid"] < t["amount"] and (to is None or t["to"] == to)]
+
+    if not open_:
+        owes = [t for t in transfers if t["from"] == payer and t["repaid"] < t["amount"]]
+        if not owes:
+            await _reply(ctx, user, f"{payer} doesn't owe anyone anything right now.")
+        else:
+            listing = ", ".join(f"{t['to']} {replies.rupees(t['amount'] - t['repaid'])}" for t in owes)
+            await _reply(ctx, user, f"{payer} doesn't owe {to}. {payer} still owes: {listing}.")
+        return True
+
+    if len(open_) > 1:
+        remaining = {id(t): t["amount"] - t["repaid"] for t in open_}
+        everything = re.search(r"\b(both|all|everyone|everything|in full|fully)\b", text, re.IGNORECASE)
+        exact = [t for t in open_ if amount is not None and remaining[id(t)] == amount]
+        if everything or (amount is not None and amount == sum(remaining.values())):
+            for t in open_:
+                t["repaid"] = t["amount"]
+        elif len(exact) == 1:
+            exact[0]["repaid"] = exact[0]["amount"]
+        else:
+            listing = " and ".join(f"{t['to']} {replies.rupees(remaining[id(t)])}" for t in open_)
+            await _reply(
+                ctx, user,
+                f"{payer} owes {listing}. Who did {payer} pay? Say *{payer} paid {open_[0]['to']}*, "
+                f"or *{payer} paid both*.",
+            )
+            return True
+    else:
+        t = open_[0]
+        left = t["amount"] - t["repaid"]
+        if amount is not None and amount > left:
+            await _reply(
+                ctx, user,
+                f"{payer} only owes {t['to']} {replies.rupees(left)}, but you said {replies.rupees(amount)}. "
+                f"Did {payer} pay the full {replies.rupees(left)}? If so, say *{payer} paid {t['to']}*.",
+            )
+            return True
+        t["repaid"] += amount if amount is not None else left
+
+    await _reply(ctx, user, replies.tracker_text(result), card=replies.tracker_card(result))
+    return True
 
 
 @chat_proto.on_message(ChatMessage)
@@ -342,6 +546,7 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         ctx.logger.exception("Error handling message")
         SESSIONS[sender] = _new_session()
         await _reply(ctx, sender, f"Sorry, something went wrong on my side ({type(exc).__name__}). Let's start again: tell me the trip in one line.")
+    _save()
 
 
 @chat_proto.on_message(ChatAcknowledgement)
@@ -376,7 +581,7 @@ async def on_commit_payment(ctx: Context, sender: str, msg: CommitPayment):
     await ctx.send(sender, CompletePayment(transaction_id=msg.transaction_id))
     s["payment_note"] = f"Settlement fee of {pay.SETTLE_FEE_FET} testnet FET verified on the Dorado testnet (tx {msg.transaction_id[:12]}…)."
     args = s.pop("settle_args")
-    await _start_settling(ctx, sender, s, args["members"], args["payments"])
+    await _start_settling(ctx, sender, s, args["members"], args["expenses"])
 
 
 @pay.payment_proto.on_message(RejectPayment)
@@ -414,6 +619,7 @@ async def _deliver_plans(ctx: Context, resp: PlanResponse, note: str = "") -> No
     note = " ".join(extra + ([note] if note else []))
     text = replies.plans_text(s["trip"], plans, json.loads(resp.itinerary_json or "[]"), resp.data_label, note)
     await _reply(ctx, user, text, card=replies.plans_card(s["trip"], plans))
+    _save()
 
 
 async def _deliver_settlement(ctx: Context, resp: SettleResponse, note: str = "") -> None:
@@ -427,12 +633,16 @@ async def _deliver_settlement(ctx: Context, resp: SettleResponse, note: str = ""
         await _reply(ctx, user, f"I couldn't settle that: {resp.error} Please send who paid what again.")
         return
     result = json.loads(resp.result_json)
-    s["stage"] = "done"
+    for t in result["transfers"]:
+        t.setdefault("repaid", 0)
+    s["settlement"] = result
+    s["stage"] = "settled"  # stays open as a payback tracker
     note = " ".join(n for n in (s.pop("payment_note", ""), note) if n)
     await _reply(
         ctx, user, replies.settlement_text(result, s.get("chosen"), note),
-        card=replies.settlement_card(result), end=True,
+        card=replies.tracker_card(result),
     )
+    _save()
 
 
 @orchestrator.on_message(PlanResponse)
@@ -467,7 +677,9 @@ async def check_timeouts(ctx: Context):
 
 @orchestrator.on_event("startup")
 async def startup(ctx: Context):
+    loaded = _load()
     ctx.logger.info(f"SwayedPay Orchestrator running at {orchestrator.address}")
+    ctx.logger.info(f"Restored {loaded} saved conversation(s) from {STATE_FILE.name}")
     ctx.logger.info(f"Planner: {PLANNER_ADDRESS}")
     ctx.logger.info(f"Settlement: {SETTLEMENT_ADDRESS}")
     ctx.logger.info("ASI1: " + ("enabled" if asi1.enabled() else "DISABLED (no ASI_ONE_API_KEY, using rule-based parsing)"))

@@ -44,6 +44,7 @@ def offline(monkeypatch):
 
     monkeypatch.setattr(asi1, "ASI_ONE_API_KEY", "")
     monkeypatch.setattr(payments, "PAYMENT_MODE", "off")  # tests opt in explicitly
+    monkeypatch.setattr(orch, "PERSIST", False)
     orch.SESSIONS.clear()
 
 
@@ -57,7 +58,7 @@ def test_full_flow_with_card_selection():
         assert "not live fares" in ctx.last_text()
 
         await orch._handle_text(ctx, USER, '{"action": "choose_plan", "plan_id": "A"}')
-        assert "who has paid what" in ctx.last_text()
+        assert "who paid for what" in ctx.last_text() and "Book it yourself" in ctx.last_text()
 
         await orch._handle_text(ctx, USER, "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.")
         check = ctx.last_text()
@@ -67,8 +68,7 @@ def test_full_flow_with_card_selection():
         await orch._handle_text(ctx, USER, '{"action": "confirm_settle"}')
         final = ctx.last_text()
         assert "Settled" in final and "pays Aman" in final
-        assert any(isinstance(c, EndSessionContent) for c in ctx.to_user[-1].content)
-        assert orch.SESSIONS[USER]["stage"] == "done"
+        assert orch.SESSIONS[USER]["stage"] == "settled"  # stays open as a payback tracker
 
     asyncio.run(run())
 
@@ -271,5 +271,109 @@ def test_with_n_friends_is_asked_not_guessed():
         await orch._handle_text(ctx, USER, "plus me")
         assert orch.SESSIONS[USER]["trip"]["people"] == 5
         assert "Plan A" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+
+# ---------- uneven splits, payback tracking, booking links ----------
+
+async def _settle_uneven(ctx):
+    await orch._handle_text(ctx, USER, FULL)
+    await orch._handle_text(ctx, USER, "A")
+    await orch._handle_text(
+        ctx, USER,
+        "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000 for the stay, Rahul paid 1500 for dinner. Kabir skipped dinner.",
+    )
+
+
+def test_uneven_split_kabir_skipped_dinner():
+    ctx = FakeCtx()
+
+    async def run():
+        await _settle_uneven(ctx)
+        check = ctx.last_text()
+        assert "not** split equally" in check and "Kabir: ₹1,800" in check and "Dev: ₹2,175" in check
+        await orch._handle_text(ctx, USER, "yes")
+        final = ctx.last_text()
+        assert "Kabir ₹1,800" in final and "Kabir pays Aman ₹1,800" in final
+
+    asyncio.run(run())
+
+
+def test_exclusion_without_matching_payment_is_asked():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, FULL)
+        await orch._handle_text(ctx, USER, "A")
+        await orch._handle_text(ctx, USER, "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000. Kabir skipped dinner.")
+        assert "which payment was the dinner" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Rahul paid 1500 for dinner")
+        assert "not** split equally" in ctx.last_text() and "Kabir: ₹1,800" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_payback_tracking_full_partial_and_status():
+    ctx = FakeCtx()
+
+    async def run():
+        await _settle_uneven(ctx)
+        await orch._handle_text(ctx, USER, "yes")
+        await orch._handle_text(ctx, USER, "Dev paid Aman")
+        assert "Paid: Dev → Aman ₹2,175" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Kabir paid Aman 800")
+        assert "Part paid: Kabir → Aman ₹800 of ₹1,800, ₹1,000 left" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Kabir paid Aman 5000")
+        assert "only owes Aman ₹1,000" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "status")
+        assert "Payback tracker" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_payback_ambiguous_and_mark_paid_card():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, FULL)
+        await orch._handle_text(ctx, USER, "A")
+        await orch._handle_text(ctx, USER, "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.")
+        await orch._handle_text(ctx, USER, "yes")  # Kabir owes Rahul 1,600 and Aman 1,050
+        await orch._handle_text(ctx, USER, "Kabir paid")
+        assert "Who did Kabir pay?" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Kabir paid both")
+        transfers = orch.SESSIONS[USER]["settlement"]["transfers"]
+        assert all(t["repaid"] == t["amount"] for t in transfers if t["from"] == "Kabir")
+        for i, _ in enumerate(transfers):
+            await orch._handle_text(ctx, USER, f'{{"action": "mark_paid", "index": "{i}"}}')
+        assert "Everyone is settled up" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_booking_links_match_the_plan():
+    from agents.orchestrator.booking import links_for
+
+    trip = {"origin": "Kolkata", "destination": "Darjeeling"}
+    train = links_for({"transport": "Train (sleeper) + road from New Jalpaiguri", "stay": "Hostel dorm"}, trip)
+    assert any("irctc.co.in" in u for _, u in train) and any("hostels+in+Darjeeling" in u for _, u in train)
+    flight = links_for({"transport": "Flight (economy)", "stay": "Mid-range hotel"}, trip)
+    assert any("google.com/travel/flights" in u for _, u in flight)
+
+
+def test_sessions_survive_a_restart(tmp_path, monkeypatch):
+    ctx = FakeCtx()
+    monkeypatch.setattr(orch, "PERSIST", True)
+    monkeypatch.setattr(orch, "STATE_FILE", tmp_path / "sessions.json")
+
+    async def run():
+        await orch.handle_chat(ctx, USER, ChatMessage(
+            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            msg_id=__import__("uuid").uuid4(), content=[TextContent(type="text", text=FULL)]))
+        assert (tmp_path / "sessions.json").exists()
+        orch.SESSIONS.clear()
+        assert orch._load() == 1 and orch.SESSIONS[USER]["stage"] == "choose_plan"
 
     asyncio.run(run())

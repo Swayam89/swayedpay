@@ -90,17 +90,22 @@ async def extract_trip(text: str) -> dict | None:
     return extract_json(reply)
 
 
-PAYMENTS_SYSTEM_PROMPT = """You extract who is in a travel group and who paid what, for a bill-splitting agent.
+EXPENSES_SYSTEM_PROMPT = """You extract a travel group's shared expenses for a bill-splitting agent.
 Reply with ONLY a JSON object:
-- "members": list of every person's name mentioned as part of the group (include payers)
-- "payments": object mapping a name to the rupee amount they paid, as an integer
-Never invent names or amounts. If nobody paid anything, "payments" is {}."""
+- "members": every person's name mentioned as part of the group (include payers)
+- "expenses": list of {"payer": name, "amount": integer rupees, "label": what it was for in 1-2 lowercase words or "",
+   "excluded": names who did NOT share this expense, "only": names who were the ONLY ones sharing it (else [])}
+- "exclusions": list of {"name": name, "label": 1-2 lowercase words} for statements like "Kabir skipped dinner"
+   or "Isha didn't have drinks" that do not themselves state a payment
+Rules: never invent names or amounts. If an expense doesn't say who shared it, leave "excluded" and "only" empty.
+"Aman paid 9000" with no purpose has label "". Use the same label words the user used."""
 
 
-async def extract_payments(text: str) -> dict | None:
+async def extract_expenses(text: str, members: list[str] | None = None) -> dict | None:
+    context = f"Group members so far: {', '.join(members)}. " if members else ""
     reply = await chat(
-        [{"role": "system", "content": PAYMENTS_SYSTEM_PROMPT}, {"role": "user", "content": text}],
-        max_tokens=300,
+        [{"role": "system", "content": EXPENSES_SYSTEM_PROMPT}, {"role": "user", "content": context + text}],
+        max_tokens=500,
         temperature=0.0,
     )
     return extract_json(reply)
