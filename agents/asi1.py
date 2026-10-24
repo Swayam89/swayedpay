@@ -71,12 +71,14 @@ TRIP_SYSTEM_PROMPT = """You extract group-trip requests into JSON for a trip-pla
 Reply with ONLY a JSON object with these keys:
 - "origin": departure city or null
 - "destination": destination city or null
-- "people": number of travellers as an integer, or null
-- "budget_per_person": per-person budget in rupees as an integer, or null. If only a total budget is given, divide by people.
-- "nights": number of nights as an integer, or null. A weekend trip is 1 night. "3 days" means 2 nights.
+- "people": number of travellers as an integer, or null. "with 4 friends" is ambiguous (4 or 5 including the user): use null unless they said the total (e.g. "5 of us", "5 people in total")
+- "budget_amount": the budget in rupees exactly as stated, as an integer (10k = 10000), or null
+- "budget_basis": "per_person" if they said each / per person / per head, "total" if they said total / for the group / for all of us, otherwise null
+- "nights": number of nights as an integer, or null. "3 days" means 2 nights. A bare "weekend" or "trip" is NOT a number of nights: use null.
 - "date": when they travel, as the user wrote it, or null
 - "members": list of names of people in the group if given, else []
-Never invent values the user did not give. Use null instead."""
+Never guess. If something is not clearly stated, use null so the agent can ask.
+You may be told what is known so far and what the agent just asked; use that to interpret short answers like "5" or "per person"."""
 
 
 async def extract_trip(text: str) -> dict | None:

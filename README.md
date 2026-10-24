@@ -72,10 +72,13 @@ Then connect each one to Agentverse: open the **Agent Inspector** link printed i
 
 ## Try these messages
 
-- `5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max`
+- `5 of us, Delhi to Jaipur this Saturday for 1 night, ₹4,000 each`
 - `A` (or tap a plan)
 - `Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.`
+- `yes` (or tap *Yes, settle it*) after checking the summary
 - `new trip` to start over
+
+**SwayedPay never guesses.** If the date, number of nights, group size, or whether the budget is per person or for the group is missing or unclear, it asks (and shows what it has understood so far). "With 4 friends" gets a "4 in total, or 5 with you?" question. Before settling it lists who paid what, who paid nothing and that the split is equal, and waits for a *yes* or corrections. If names are missing it asks for them instead of inventing placeholders.
 
 **Works for any two places in India.** Prices are estimated from distance with realistic rules (not live fares):
 

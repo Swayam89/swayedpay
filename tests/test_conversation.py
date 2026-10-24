@@ -13,6 +13,7 @@ from agents.planner.service import make_plan_response
 from agents.settlement.service import make_settle_response
 
 USER = "agent1quser"
+FULL = "5 of us, Delhi to Jaipur this Saturday for 1 night, ₹4,000 each"
 
 
 class FakeCtx:
@@ -50,15 +51,20 @@ def test_full_flow_with_card_selection():
     ctx = FakeCtx()
 
     async def run():
-        await orch._handle_text(ctx, USER, "5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max")
+        await orch._handle_text(ctx, USER, FULL)
         assert "Plan A" in ctx.last_text()
         assert any(isinstance(c, MetadataContent) for c in ctx.to_user[-1].content)
         assert "not live fares" in ctx.last_text()
 
         await orch._handle_text(ctx, USER, '{"action": "choose_plan", "plan_id": "A"}')
-        assert "who paid what" in ctx.last_text()
+        assert "who has paid what" in ctx.last_text()
 
         await orch._handle_text(ctx, USER, "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.")
+        check = ctx.last_text()
+        assert "Before I settle" in check and "Dev, Isha, Kabir paid nothing" in check
+        assert orch.SESSIONS[USER]["stage"] == "confirm_settle"
+
+        await orch._handle_text(ctx, USER, '{"action": "confirm_settle"}')
         final = ctx.last_text()
         assert "Settled" in final and "pays Aman" in final
         assert any(isinstance(c, EndSessionContent) for c in ctx.to_user[-1].content)
@@ -67,14 +73,70 @@ def test_full_flow_with_card_selection():
     asyncio.run(run())
 
 
-def test_asks_for_missing_details_then_plans():
+def test_asks_for_every_missing_detail_then_plans():
     ctx = FakeCtx()
 
     async def run():
         await orch._handle_text(ctx, USER, "Delhi to Agra trip, 4 friends")
-        assert "budget per person" in ctx.last_text()
-        await orch._handle_text(ctx, USER, "3500")
+        ask = ctx.last_text()
+        assert "When are you travelling?" in ask and "How many nights" in ask and "budget" in ask
+        assert orch.SESSIONS[USER]["stage"] == "need_info"
+        await orch._handle_text(ctx, USER, "next saturday, 1 night, 3500 each")
         assert "Plan A" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_nights_are_never_assumed():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, "5 of us, Surat to Delhi next Friday, ₹10,000 each")
+        ask = ctx.last_text()
+        assert "How many nights" in ask and "usually works well" in ask
+        await orch._handle_text(ctx, USER, "3")
+        assert "Plan A" in ctx.last_text() and "3 nights" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_budget_basis_is_asked_not_assumed():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, "5 of us, Delhi to Jaipur this Saturday for 1 night, budget 20000")
+        assert "per person or for the whole group" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "for the whole group")
+        assert orch.SESSIONS[USER]["trip"]["budget_per_person"] == 4000
+        assert "Plan A" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_weekend_is_not_read_as_a_number_of_nights():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, "weekend trip, 4 of us, Mumbai to Lonavala this weekend, 3000 each")
+        assert "How many nights" in ctx.last_text()
+
+    asyncio.run(run())
+
+
+def test_missing_names_are_asked_and_corrections_work():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, FULL)
+        await orch._handle_text(ctx, USER, "A")
+        await orch._handle_text(ctx, USER, "Aman paid 9000, Rahul paid 4250")
+        assert "other 3" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Dev, Isha and Kabir")
+        assert "Before I settle" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "Dev paid 500")
+        assert "Dev paid ₹500" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "yes")
+        assert "Settled" in ctx.last_text() and "₹13,750" in ctx.last_text()
 
     asyncio.run(run())
 
@@ -83,7 +145,7 @@ def test_worker_timeout_falls_back_locally(monkeypatch):
     ctx = FakeCtx(deliver_workers=False)
 
     async def run():
-        await orch._handle_text(ctx, USER, "5 of us, Delhi to Jaipur, ₹4,000 each")
+        await orch._handle_text(ctx, USER, FULL)
         assert orch.SESSIONS[USER]["stage"] == "planning"
         orch.SESSIONS[USER]["pending"]["since"] -= 999
         await orch.check_timeouts(ctx)
@@ -108,9 +170,10 @@ from agents.orchestrator import payments as pay  # noqa: E402
 
 
 async def _to_payment_step(ctx):
-    await orch._handle_text(ctx, USER, "5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max")
+    await orch._handle_text(ctx, USER, FULL)
     await orch._handle_text(ctx, USER, "A")
     await orch._handle_text(ctx, USER, "Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.")
+    await orch._handle_text(ctx, USER, "yes")
 
 
 def _commit(tx="ABC123TX"):
@@ -191,9 +254,22 @@ def test_asi_one_mention_prefix_is_stripped():
         return ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[TextContent(type="text", text=text)])
 
     async def run():
-        await orch.handle_chat(ctx, USER, chat(f"{mention} 5 of us, Delhi to Jaipur, ₹4,000 each"))
+        await orch.handle_chat(ctx, USER, chat(f"{mention} {FULL}"))
         assert orch.SESSIONS[USER]["stage"] == "choose_plan"
         await orch.handle_chat(ctx, USER, chat(f"{mention} A"))
         assert orch.SESSIONS[USER]["stage"] == "need_payments"
+
+    asyncio.run(run())
+
+
+def test_with_n_friends_is_asked_not_guessed():
+    ctx = FakeCtx()
+
+    async def run():
+        await orch._handle_text(ctx, USER, "Pune to Goa with 4 friends on 12 dec for 2 nights, 8000 each")
+        assert "4 people in total, or 4 friends plus you (5)" in ctx.last_text()
+        await orch._handle_text(ctx, USER, "plus me")
+        assert orch.SESSIONS[USER]["trip"]["people"] == 5
+        assert "Plan A" in ctx.last_text()
 
     asyncio.run(run())

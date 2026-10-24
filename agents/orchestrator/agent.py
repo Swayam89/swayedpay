@@ -11,6 +11,7 @@ the result itself with the same code and says so.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -39,7 +40,19 @@ from uagents_core.contrib.protocols.payment import CancelPayment, CommitPayment,
 from agents.models import PlanRequest, PlanResponse, SettleRequest, SettleResponse
 from agents.orchestrator import payments as pay
 from agents.orchestrator import replies
-from agents.parsing import merge_trip, missing_fields, parse_card_selection, parse_payments, parse_trip
+from agents.data import geo
+from agents.data.sample_prices import RouteError, build_route, suggested_nights
+from agents.parsing import (
+    answer_for,
+    budget_per_person,
+    is_no,
+    is_yes,
+    merge_trip,
+    missing_questions,
+    parse_card_selection,
+    parse_payments,
+    parse_trip,
+)
 from agents.planner.service import make_plan_response
 from agents.settlement.service import make_settle_response
 
@@ -58,7 +71,10 @@ SESSIONS: dict[str, dict] = {}
 
 
 def _new_session() -> dict:
-    return {"stage": "idle", "trip": {}, "plans": [], "chosen": None, "pending": None}
+    return {
+        "stage": "idle", "trip": {}, "asked": [], "plans": [], "chosen": None, "pending": None,
+        "members": [], "payments": {}, "awaiting_names": False,
+    }
 
 
 def _session(user: str) -> dict:
@@ -69,28 +85,76 @@ async def _reply(ctx: Context, user: str, text: str, card: dict | None = None, e
     await ctx.send(user, replies.message(text, card=card, end_session=end))
 
 
-# ---------- intake ----------
+# ---------- intake: never guess, always ask ----------
 
-async def _understand_trip(text: str, known: dict) -> dict:
-    """ASI1 first, rule-based parser for anything it misses."""
-    prompt = text if not known else f"Known so far: {json.dumps(known)}. The user now says: {text}"
+async def _understand_trip(text: str, known: dict, asked: list) -> dict:
+    """ASI1 first (with what we know and what we asked), rule-based parser as backup."""
+    if known or asked:
+        question = " ".join(q for _, q in asked)
+        prompt = f"Known so far: {json.dumps(known)}. The agent just asked: {question} The user now says: {text}"
+    else:
+        prompt = text
     llm = await asi1.extract_trip(prompt)
-    trip = merge_trip(known, parse_trip(text))
+    rule = parse_trip(text)
+    trip = merge_trip(known, rule)
     trip = merge_trip(trip, llm)
-    # Short answers to a follow-up question ("Delhi", "5", "4000").
-    stripped = text.strip().replace(",", "").replace("₹", "")
-    if not llm and stripped.isdigit():
-        value = int(stripped)
-        if not trip.get("people") and value <= 50:
-            trip["people"] = value
-        elif not trip.get("budget_per_person"):
-            trip["budget_per_person"] = value
-    elif not llm and stripped.replace(" ", "").isalpha() and len(stripped.split()) <= 3:
-        if not trip.get("origin"):
-            trip["origin"] = stripped.title()
-        elif not trip.get("destination"):
-            trip["destination"] = stripped.title()
+    if rule.get("people_hint") and not known.get("people"):
+        # "with 4 friends" is 4 or 5: never let a guess through, ask instead.
+        trip["people"] = None
+        trip["people_hint"] = rule["people_hint"]
+    # A short reply to exactly one question is read as the answer to that question only.
+    if len(asked) == 1 and not trip.get(asked[0][0]):
+        trip = merge_trip(trip, answer_for(asked[0][0], text, trip.get("people_hint")))
+    elif any(f == "people" for f, _ in asked) and trip.get("people_hint") and not trip.get("people"):
+        trip = merge_trip(trip, answer_for("people", text, trip["people_hint"]))
     return trip
+
+
+async def _check_places(trip: dict) -> str:
+    """Validate the route as soon as both ends are known. Returns a problem to tell the user, or ''."""
+    if not (trip.get("origin") and trip.get("destination")):
+        return ""
+    try:
+        await asyncio.to_thread(build_route, trip["origin"], trip["destination"])
+        return ""
+    except RouteError as exc:
+        for field in ("origin", "destination"):
+            if not await asyncio.to_thread(geo.coords, trip[field]):
+                trip[field] = None
+                return str(exc)
+        trip["destination"] = None
+        return str(exc)
+
+
+async def _nights_hint(trip: dict) -> str:
+    if trip.get("nights") or not (trip.get("origin") and trip.get("destination")):
+        return ""
+    try:
+        route = await asyncio.to_thread(build_route, trip["origin"], trip["destination"])
+    except Exception:
+        return ""
+    n = suggested_nights(route)
+    return f"For a ~{route['distance_km']:,} km trip, about {n} night{'s' if n != 1 else ''} usually works well, but it's your call."
+
+
+async def _intake(ctx: Context, user: str, s: dict, text: str) -> None:
+    known = s["trip"] if s["stage"] == "need_info" else {}
+    asked = s["asked"] if s["stage"] == "need_info" else []
+    trip = await _understand_trip(text, known, asked)
+    s["trip"] = trip
+    problem = await _check_places(trip)
+    questions = missing_questions(trip)
+    if questions:
+        s["stage"] = "need_info"
+        s["asked"] = questions
+        if not known and not any(trip.get(k) for k in ("origin", "destination", "people", "budget_amount")):
+            await _reply(ctx, user, replies.GREETING)  # e.g. "hi"
+            return
+        await _reply(ctx, user, replies.ask_questions(trip, questions, problem, await _nights_hint(trip)))
+        return
+    s["asked"] = []
+    trip["budget_per_person"] = budget_per_person(trip)
+    await _start_planning(ctx, user, s)
 
 
 async def _start_planning(ctx: Context, user: str, s: dict) -> None:
@@ -101,7 +165,7 @@ async def _start_planning(ctx: Context, user: str, s: dict) -> None:
         destination=trip["destination"],
         people=int(trip["people"]),
         budget_per_person=int(trip["budget_per_person"]),
-        nights=int(trip.get("nights") or 0),
+        nights=int(trip["nights"]),
         date=str(trip.get("date") or ""),
     )
     s["stage"] = "planning"
@@ -153,6 +217,8 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
         if plan:
             s["chosen"] = plan
             s["stage"] = "need_payments"
+            s["members"] = [m.title() for m in (s["trip"].get("members") or [])]
+            s["payments"] = {}
             await _reply(ctx, user, replies.ask_payments(plan, int(s["trip"]["people"])))
             return
         guess = parse_trip(text)
@@ -162,60 +228,101 @@ async def _handle_text(ctx: Context, user: str, text: str) -> None:
             return
         s.update(_new_session())  # looks like a fresh trip request
 
+    if s["stage"] == "confirm_settle":
+        if (selection or {}).get("action") == "confirm_settle" or is_yes(text):
+            await _proceed_to_settle(ctx, user, s)
+            return
+        corrections = parse_payments(text)
+        if is_no(text) and not (corrections["payments"] or corrections["members"]):
+            await _reply(ctx, user, "What should I change? For example: *Dev paid 500*, *also add Priya*, or *remove Kabir*.")
+            return
+        s["stage"] = "need_payments"  # treat the reply as corrections
+
     if s["stage"] == "need_payments":
-        llm = await asi1.extract_payments(text) or {}
-        rule = parse_payments(text)
-        payments = {}
-        for source in (rule.get("payments") or {}, llm.get("payments") or {}):
-            for name, amount in source.items():
-                try:
-                    payments[str(name).strip().title()] = int(float(str(amount).replace(",", "")))
-                except ValueError:
-                    continue
-        members: list[str] = []
-        for name in list(llm.get("members") or []) + list(rule.get("members") or []) + list(payments):
-            name = str(name).strip().title()
-            if name and name not in members:
-                members.append(name)
-        if not payments:
-            await _reply(
-                ctx, user,
-                "I couldn't tell who paid what. Try: *Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.*",
-            )
-            return
-        people = int(s["trip"].get("people") or len(members))
-        i = 1
-        while len(members) < people:
-            filler = f"Friend {i}"
-            if filler not in members:
-                members.append(filler)
-            i += 1
-        if pay.fee_enabled():
-            s["stage"] = "awaiting_payment"
-            s["settle_args"] = {"members": members, "payments": payments}
-            await _reply(
-                ctx, user,
-                f"Got it: {len(members)} people, {replies.rupees(sum(payments.values()))} paid in total. "
-                f"Planning is free; settling costs a {pay.SETTLE_FEE_FET} testnet FET convenience fee. "
-                "Approve the payment card and I'll split the bill.",
-            )
-            await _request_fee(ctx, user, s)
-            return
-        await _start_settling(ctx, user, s, members, payments)
+        await _collect_payments(ctx, user, s, text)
         return
 
     # idle, need_info or done: treat as (part of) a trip request
-    known = s["trip"] if s["stage"] == "need_info" else {}
-    s["trip"] = await _understand_trip(text, known)
-    missing = missing_fields(s["trip"])
-    if missing:
-        s["stage"] = "need_info"
-        if not known and len(missing) >= 3:  # e.g. "hi": show what SwayedPay does
-            await _reply(ctx, user, replies.GREETING)
-        else:
-            await _reply(ctx, user, replies.ask_missing(missing))
+    await _intake(ctx, user, s, text)
+
+
+def _names_from_reply(text: str) -> list[str]:
+    """A reply that is just names: 'Dev, Isha and Kabir' or 'Kabir'."""
+    parts = re.split(r",|\band\b|&|\n", text)
+    names = []
+    for part in parts:
+        part = part.strip().strip(".")
+        if re.fullmatch(r"[A-Za-z][A-Za-z'-]{0,19}", part) and part.lower() not in {"also", "add", "and", "the", "others"}:
+            names.append(part.title())
+    return names
+
+
+async def _collect_payments(ctx: Context, user: str, s: dict, text: str) -> None:
+    if s.get("awaiting_names") and s["members"] and re.search(
+        r"that'?s (?:everyone|all|it)|that is (?:everyone|all)|no ?one else|nobody else|only (?:us|them|these)|just (?:us|them|these)",
+        text, re.IGNORECASE,
+    ):
+        s["awaiting_names"] = False
+        s["trip"]["people"] = len(s["members"])
+        s["stage"] = "confirm_settle"
+        text_out, card = replies.confirm_settlement(s["members"], s["payments"], len(s["members"]))
+        await _reply(ctx, user, text_out, card=card)
         return
-    await _start_planning(ctx, user, s)
+
+    removed = re.findall(r"remove\s+([A-Za-z]+)", text, re.IGNORECASE)
+    for name in removed:
+        name = name.title()
+        s["members"] = [m for m in s["members"] if m != name]
+        s["payments"].pop(name, None)
+
+    llm = await asi1.extract_payments(text) or {}
+    rule = parse_payments(text)
+    for source in (rule.get("payments") or {}, llm.get("payments") or {}):
+        for name, amount in source.items():
+            try:
+                s["payments"][str(name).strip().title()] = int(float(str(amount).replace(",", "")))
+            except ValueError:
+                continue
+    new_names = list(llm.get("members") or []) + list(rule.get("members") or []) + list(s["payments"])
+    if s.get("awaiting_names") and not new_names:
+        new_names = _names_from_reply(text)
+    for name in new_names:
+        name = str(name).strip().title()
+        if name and name not in s["members"] and name not in [r.title() for r in removed]:
+            s["members"].append(name)
+    s["awaiting_names"] = False
+
+    people = int(s["trip"].get("people") or 0)
+    if not s["payments"]:
+        await _reply(
+            ctx, user,
+            "Who paid for what so far? For example: *Aman paid 9000, Rahul paid 4250.* "
+            "If nobody has paid yet, I can't settle anything.",
+        )
+        return
+    if people and len(s["members"]) < people:
+        s["awaiting_names"] = True
+        await _reply(ctx, user, replies.ask_missing_names(s["members"], people))
+        return
+    s["stage"] = "confirm_settle"
+    text_out, card = replies.confirm_settlement(s["members"], s["payments"], people)
+    await _reply(ctx, user, text_out, card=card)
+
+
+async def _proceed_to_settle(ctx: Context, user: str, s: dict) -> None:
+    members, payments = list(s["members"]), dict(s["payments"])
+    if pay.fee_enabled():
+        s["stage"] = "awaiting_payment"
+        s["settle_args"] = {"members": members, "payments": payments}
+        await _reply(
+            ctx, user,
+            f"Confirmed: {len(members)} people, {replies.rupees(sum(payments.values()))} paid in total. "
+            f"Planning is free; settling costs a {pay.SETTLE_FEE_FET} testnet FET convenience fee. "
+            "Approve the payment card and I'll split the bill.",
+        )
+        await _request_fee(ctx, user, s)
+        return
+    await _start_settling(ctx, user, s, members, payments)
 
 
 @chat_proto.on_message(ChatMessage)

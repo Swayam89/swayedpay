@@ -71,17 +71,90 @@ def message(text: str, card: dict[str, Any] | None = None, end_session: bool = F
 
 GREETING = (
     "Hi, I'm **SwayedPay**. I plan group trips that fit your budget and then settle who owes whom.\n\n"
-    "Tell me the trip in one line, for example:\n"
-    "*5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max.*"
+    "Tell me about the trip: where from and to, how many people, when, how many nights, "
+    "and your budget (per person or for the group). For example:\n"
+    "*5 of us, Delhi to Jaipur this Saturday for 1 night, ₹4,000 each.*\n\n"
+    "If anything is missing, I'll ask rather than guess."
 )
 
 
-def ask_missing(missing: list[str]) -> str:
-    if len(missing) == 1:
-        need = missing[0]
+def known_summary(trip: dict) -> str:
+    parts = []
+    if trip.get("origin") or trip.get("destination"):
+        parts.append(f"{trip.get('origin') or '?'} → {trip.get('destination') or '?'}")
+    if trip.get("people"):
+        parts.append(f"{trip['people']} people")
+    if trip.get("date"):
+        parts.append(str(trip["date"]))
+    if trip.get("nights"):
+        parts.append(f"{trip['nights']} night{'s' if trip['nights'] != 1 else ''}")
+    if trip.get("budget_amount"):
+        basis = {"per_person": " per person", "total": " for the group"}.get(trip.get("budget_basis"), "")
+        parts.append(f"{rupees(trip['budget_amount'])}{basis}")
+    return " · ".join(parts)
+
+
+def ask_questions(trip: dict, questions: list[tuple[str, str]], problem: str = "", hint: str = "") -> str:
+    lines = []
+    if problem:
+        lines += [problem, ""]
+    summary = known_summary(trip)
+    if summary:
+        lines += [f"So far: {summary}", ""]
+    if len(questions) == 1:
+        lines.append(f"One more thing: {questions[0][1]}")
     else:
-        need = ", ".join(missing[:-1]) + " and " + missing[-1]
-    return f"Happy to plan this. I still need {need}."
+        lines.append("Before I plan anything, a few questions:")
+        lines += [f"{i}. {q}" for i, (_, q) in enumerate(questions, start=1)]
+    if hint and any(f == "nights" for f, _ in questions):
+        lines += ["", f"_{hint}_"]
+    return "\n".join(lines)
+
+
+def ask_missing_names(members: list[str], people: int) -> str:
+    missing = people - len(members)
+    have = ", ".join(members) if members else "none yet"
+    return (
+        f"You said {people} people are going, and I have {len(members)} name{'s' if len(members) != 1 else ''} "
+        f"({have}). What {'is the name' if missing == 1 else 'are the names'} of the other {missing}?\n\n"
+        "If the group is actually smaller, say *that's everyone*."
+    )
+
+
+def confirm_settlement(members: list[str], payments: dict, people: int) -> tuple[str, dict[str, Any]]:
+    total = sum(payments.values())
+    share = total / len(members) if members else 0
+    payers = [f"- {n} paid {rupees(payments[n])}" for n in members if payments.get(n)]
+    non_payers = [n for n in members if not payments.get(n)]
+    lines = ["**Before I settle, please check this is right:**", ""] + payers
+    if non_payers:
+        lines.append(f"- {', '.join(non_payers)} paid nothing")
+    lines += [
+        "",
+        f"Total {rupees(total)}, split **equally** between {len(members)} people ({rupees(share)} each).",
+    ]
+    if people and len(members) != people:
+        lines.append(f"Note: you said {people} people earlier, but this list has {len(members)}.")
+    lines += ["", "Reply **yes** to settle, or correct anything (e.g. *Dev paid 500*, *remove Kabir*)."]
+    rows = [{"type": "text", "value": f"{n}: {rupees(payments.get(n, 0))}", "style": "body"} for n in members]
+    card = {
+        "root": {
+            "type": "section",
+            "title": "Check before settling",
+            "subtitle": f"{rupees(total)} total · split equally · {rupees(share)} each",
+            "children": [
+                {"type": "group", "direction": "column", "gap": 6, "children": rows},
+                {"type": "divider"},
+                {
+                    "type": "button",
+                    "label": "Yes, settle it",
+                    "primary": True,
+                    "action": {"selection": {"action": "confirm_settle"}},
+                },
+            ],
+        }
+    }
+    return "\n".join(lines), card
 
 
 def trip_summary(trip: dict) -> str:
@@ -174,7 +247,7 @@ def ask_payments(plan: dict, people: int) -> str:
     return (
         f"Plan {plan['id']} it is: {transport_label(plan)} + {plan['stay']}, "
         f"{rupees(plan['total'])} for the group.\n\n"
-        f"Now tell me who's in the group of {people} and who paid what, for example:\n"
+        f"Now tell me the names of all {people} people and who has paid what so far, for example:\n"
         "*Aman, Rahul, Dev, Isha, Kabir. Aman paid 9000, Rahul paid 4250.*"
     )
 

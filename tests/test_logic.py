@@ -3,25 +3,32 @@ import json
 import pytest
 
 from agents.orchestrator import replies
-from agents.parsing import missing_fields, parse_card_selection, parse_payments, parse_trip
+from agents.parsing import budget_per_person, missing_questions, parse_card_selection, parse_payments, parse_trip
 from agents.data.sample_prices import build_route
 from agents.planner.logic import build_plans
 from agents.settlement.logic import settle
 
 
 def test_parse_trip_one_liner():
-    trip = parse_trip("5 of us, Delhi to Jaipur this Saturday, ₹4,000 each max.")
-    assert trip["origin"] == "Delhi"
-    assert trip["destination"] == "Jaipur"
-    assert trip["people"] == 5
-    assert trip["budget_per_person"] == 4000
+    trip = parse_trip("5 of us, Delhi to Jaipur this Saturday for 1 night, ₹4,000 each.")
+    assert trip["origin"] == "Delhi" and trip["destination"] == "Jaipur"
+    assert trip["people"] == 5 and trip["nights"] == 1
+    assert trip["budget_amount"] == 4000 and trip["budget_basis"] == "per_person"
+    assert budget_per_person(trip) == 4000
     assert trip["date"] == "this saturday"
-    assert missing_fields(trip) == []
+    assert missing_questions(trip) == []
 
 
-def test_parse_trip_reports_missing():
-    trip = parse_trip("Goa trip with friends")
-    assert "how many people are going" in missing_fields(trip)
+def test_unstated_details_become_questions():
+    trip = parse_trip("Goa trip with friends, budget 40000")
+    fields = [f for f, _ in missing_questions(trip)]
+    assert {"origin", "people", "date", "nights", "budget_basis"} <= set(fields)
+    assert budget_per_person(trip) is None
+
+
+def test_total_budget_is_divided_only_when_stated():
+    trip = parse_trip("4 of us, Pune to Goa, 2 nights next month, 40k total")
+    assert trip["budget_basis"] == "total" and budget_per_person(trip) == 10000
 
 
 def test_budget_fit_keeps_comfort_when_possible():
